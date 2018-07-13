@@ -12,6 +12,12 @@ import oeqa.utils.ftools as ftools
 from oeqa.utils.commands import runCmd, bitbake, get_bb_var
 from oeqa.core.case import OETestCase
 
+import time
+
+def logit(msg):
+    print(str(time.time()) + " " + msg)
+    sys.stdout.flush()
+
 class OESelftestTestCase(OETestCase):
     def __init__(self, methodName="runTest"):
         self._extra_tear_down_commands = []
@@ -148,11 +154,15 @@ to ensure accurate results.")
         # but if they overwrite this one they have to call
         # super each time, so let's give them an alternative
         self.setUpLocal()
+        logit("Starting %s" % self.id())
+        self.starttime = time.time()
 
     def setUpLocal(self):
         pass
 
     def tearDown(self):
+        self.endtime = time.time()
+        logit("Finishing %s (%ss)" % (self.id(), "{0:.2f}".format(self.endtime - self.starttime)))
         if self._extra_tear_down_commands:
             failed_extra_commands = []
             for command in self._extra_tear_down_commands:
