@@ -15,12 +15,17 @@ import sys
 import traceback
 import unittest
 import subprocess
+import testtools
 from itertools import cycle
+from queue import Queue
+import threading
+import time
+import io
 
 from subunit import ProtocolTestCase, TestProtocolClient
 from subunit.test_results import AutoTimingTestResultDecorator
 
-from testtools import ConcurrentTestSuite, iterate_tests
+from testtools import ThreadsafeForwardingResult, iterate_tests
 
 import bb.utils
 import oe.path
@@ -30,6 +35,101 @@ _all__ = [
     'fork_for_tests',
     'partition_tests',
 ]
+
+class BBThreadsafeForwardingResult(ThreadsafeForwardingResult):
+
+    def __init__(self, target, semaphore, testnum, total):
+        super(BBThreadsafeForwardingResult, self).__init__(target, semaphore)
+        self.testnum = testnum
+        self.total = total
+
+    def _add_result_with_semaphore(self, method, test, *args, **kwargs):
+        self.semaphore.acquire()
+        try:
+            self.result.starttime[test.id()] = self._test_start.timestamp()
+            self.result.proginfo2[self.testnum].append(test.id())
+            self.result.proginfo[test.id()] = "%s:%s/%s (%ss) (%s)" % (self.testnum, len(self.result.proginfo2[self.testnum]), self.total, "{0:.2f}".format(time.time()-self._test_start.timestamp()), test.id())
+        finally:
+            self.semaphore.release()
+        super(BBThreadsafeForwardingResult, self)._add_result_with_semaphore(method, test, *args, **kwargs)
+
+class dummybuf(object):
+   def __init__(self, parent):
+       self.p = parent
+   def write(self, data):
+       self.p.write(data.decode("utf-8"))
+
+class ConcurrentTestSuite(unittest.TestSuite):
+    """A TestSuite whose run() calls out to a concurrency strategy."""
+
+    def __init__(self, suite, make_tests):
+        """Create a ConcurrentTestSuite to execute suite.
+
+        :param suite: A suite to run concurrently.
+        :param make_tests: A helper function to split the tests in the
+            ConcurrentTestSuite into some number of concurrently executing
+            sub-suites. make_tests must take a suite, and return an iterable
+            of TestCase-like object, each of which must have a run(result)
+            method.
+        """
+        super(ConcurrentTestSuite, self).__init__([suite])
+        self.make_tests = make_tests
+
+    def run(self, result):
+        """Run the tests concurrently.
+
+        This calls out to the provided make_tests helper, and then serialises
+        the results so that result only sees activity from one TestCase at
+        a time.
+
+        ConcurrentTestSuite provides no special mechanism to stop the tests
+        returned by make_tests, it is up to the make_tests to honour the
+        shouldStop attribute on the result object they are run with, which will
+        be set if an exception is raised in the thread which
+        ConcurrentTestSuite.run is called in.
+        """
+        tests = self.make_tests(self)
+        try:
+            threads = {}
+            queue = Queue()
+            semaphore = threading.Semaphore(1)
+            result.proginfo2 = {}
+            for i, (test, testnum) in enumerate(tests):
+                result.proginfo2[i] = []
+                process_result = BBThreadsafeForwardingResult(result, semaphore, i, testnum)
+                # Force buffering of stdout/stderr so the console doesn't get corrupted by test output
+                # as per default in parent code
+                process_result.buffer = True
+                process_result._stderr_buffer = io.StringIO()
+                process_result._stderr_buffer.buffer = dummybuf(process_result._stderr_buffer)
+                process_result._stdout_buffer = io.StringIO()
+                process_result._stdout_buffer.buffer = dummybuf(process_result._stdout_buffer)
+                reader_thread = threading.Thread(
+                    target=self._run_test, args=(test, process_result, queue))
+                threads[test] = reader_thread, process_result
+                reader_thread.start()
+            while threads:
+                finished_test = queue.get()
+                threads[finished_test][0].join()
+                del threads[finished_test]
+        except:
+            for thread, process_result in threads.values():
+                process_result.stop()
+            raise
+
+    def _run_test(self, test, process_result, queue):
+        try:
+            try:
+                test.run(process_result)
+            except Exception:
+                # The run logic itself failed.
+                case = testtools.ErrorHolder(
+                    "broken-runner",
+                    error=sys.exc_info())
+                case.run(process_result)
+        finally:
+            queue.put(test)
+
 
 def fork_for_tests(concurrency_num):
     """Implementation of `make_tests` used to construct `ConcurrentTestSuite`.
@@ -52,7 +152,10 @@ def fork_for_tests(concurrency_num):
         test_blocks = partition_tests(suite, concurrency_num)
         # Clear the tests from the original suite so it doesn't keep them alive
         suite._tests[:] = []
+        print(str(test_blocks))
         for process_tests in test_blocks:
+            print(str(process_tests))
+            numtests = len(process_tests)
             process_suite = unittest.TestSuite(process_tests)
             # Also clear each split list so new suite has only reference
             process_tests[:] = []
@@ -107,9 +210,11 @@ def fork_for_tests(concurrency_num):
                     newsi = os.open(os.devnull, os.O_RDWR)
                     os.dup2(newsi, sys.stdin.fileno())
 
-                    subunit_result = AutoTimingTestResultDecorator(
-                        TestProtocolClient(stream)
-                    )
+                    subunit_client = TestProtocolClient(stream)
+                    # Force buffering of stdout/stderr so the console doesn't get corrupted by test output
+                    # as per default in parent code
+                    subunit_client.buffer = True
+                    subunit_result = AutoTimingTestResultDecorator(subunit_client)
                     process_suite.run(subunit_result)
                     if ourpid != os.getpid():
                         os._exit(0)
@@ -137,7 +242,7 @@ def fork_for_tests(concurrency_num):
                 os.close(c2pwrite)
                 stream = os.fdopen(c2pread, 'rb', 1)
                 test = ProtocolTestCase(stream)
-                result.append(test)
+                result.append((test, numtests))
         return result
     return do_fork
 
