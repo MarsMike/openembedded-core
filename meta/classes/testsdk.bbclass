@@ -65,7 +65,7 @@ def testsdk_main(d):
             import traceback
             bb.fatal("Loading tests failed:\n%s" % traceback.format_exc())
 
-        result = tc.runTests()
+        result = tc.runTests(processes=5)
 
         component = "%s %s" % (pn, OESDKTestContextExecutor.name)
         context_msg = "%s:%s" % (os.path.basename(tcname), os.path.basename(sdk_env))
